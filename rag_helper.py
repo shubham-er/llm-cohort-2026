@@ -1,3 +1,35 @@
+from http import client
+from contextlib import contextmanager
+
+from google.genai.types import GenerateContentConfig
+
+
+try:
+    from opentelemetry import trace
+except ImportError:
+    trace = None
+
+
+class _DummySpan:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class _DummyTracer:
+    @contextmanager
+    def start_as_current_span(self, name, **kwargs):
+        yield _DummySpan()
+
+
+def _default_tracer():
+    if trace is not None:
+        return trace.get_tracer(__name__)
+    return _DummyTracer()
+
+
 INSTRUCTIONS = '''
 Your task is to answer questions from the course participants
 based on the provided context.
@@ -23,34 +55,25 @@ class RAGBase:
         llm_client,
         instructions=INSTRUCTIONS,
         prompt_template=PROMPT_TEMPLATE,
-        course='llm-zoomcamp',
-        model='gpt-5.4-mini'
+        model='gpt-5.4-mini',
+        tracer=None,
     ):
         self.index = index
         self.llm_client = llm_client
         self.instructions = instructions
-        self.course = course
         self.prompt_template = prompt_template
         self.model = model
+        self.tracer = tracer or _default_tracer()
 
     def search(self, query, num_results=5):
-        boost_dict = {'question': 3.0, 'section': 0.5}
-        filter_dict = {'course': self.course}
-
-        return self.index.search(
-            query,
-            num_results=num_results,
-            boost_dict=boost_dict,
-            filter_dict=filter_dict
-        )
+        return self.index.search(query, num_results=num_results)
 
     def build_context(self, search_results):
         lines = []
 
         for doc in search_results:
-            lines.append(doc['section'])
-            lines.append('Q: ' + doc['question'])
-            lines.append('A: ' + doc['answer'])
+            lines.append(doc['filename'])
+            lines.append(doc['content'])
             lines.append('')
 
         return '\n'.join(lines).strip()
@@ -60,22 +83,36 @@ class RAGBase:
         return self.prompt_template.format(
             question=query, context=context
         )
-
+    
     def llm(self, prompt):
-        input_messages = [
-            {'role': 'developer', 'content': self.instructions},
-            {'role': 'user', 'content': prompt}
-        ]
-
-        response = self.llm_client.responses.create(
-            model=self.model,
-            input=input_messages
+        response = self.llm_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=GenerateContentConfig(
+                response_mime_type="application/json",
+                system_instruction=self.instructions,
+            ),
         )
 
-        return response.output_text
+        return response
 
     def rag(self, query):
         search_results = self.search(query)
         prompt = self.build_prompt(query, search_results)
         answer = self.llm(prompt)
-        return answer
+        return answer.text
+
+
+class RAGTraced(RAGBase):
+
+    def search(self, query, num_results=5):
+        with self.tracer.start_as_current_span("search"):
+            return super().search(query, num_results=num_results)
+
+    def llm(self, prompt):
+        with self.tracer.start_as_current_span("llm"):
+            return super().llm(prompt)
+
+    def rag(self, query):
+        with self.tracer.start_as_current_span("rag"):
+            return super().rag(query)
